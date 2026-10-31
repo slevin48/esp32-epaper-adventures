@@ -33,6 +33,14 @@ Taken from Waveshare's V2 ESP-IDF examples (`02_Example/ESP-IDF/V2`), since the 
 | LED | 3 |
 | Touch (Touch version only) | INT 21, RST 7 |
 
+## Battery
+
+The battery plugs into the 2-pin MX1.25 lithium battery connector. I followed Waveshare's video: [Battery assembly guide: ESP32 1.54-inch e-ink screen series](https://www.youtube.com/watch?v=IWxYoRuI4wc).
+
+- Hold **PWR** (GPIO 18) to turn the board on or off when running on battery.
+- Firmware keeps the board powered by driving **GPIO 17** (battery power hold) high.
+- Battery voltage can be read on **ADC1 channel 3 (GPIO 4)**. See Waveshare's `01_ADC_Test` and `07_BATT_PWR_Test` examples.
+
 ## Tooling
 
 - **ESP-IDF:** v5.5 or newer

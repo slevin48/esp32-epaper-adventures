@@ -27,4 +27,5 @@ Full pin map and setup notes: [docs/board.md](docs/board.md)
 
 - [Waveshare wiki](https://docs.waveshare.com/ESP32-S3-ePaper-1.54)
 - [Waveshare example code](https://github.com/waveshareteam/ESP32-S3-ePaper-1.54) (use the **V2** examples; V1 code is not compatible)
+- [Battery assembly guide (video)](https://www.youtube.com/watch?v=IWxYoRuI4wc)
 - [ESP-IDF docs (ESP32-S3)](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/)
