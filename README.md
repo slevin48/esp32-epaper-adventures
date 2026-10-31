@@ -25,6 +25,7 @@ Full pin map and setup notes: [docs/board.md](docs/board.md)
 
 - 2026-10-31 · [First contact](journal/2026-10-31-first-contact.md): connecting to the board, identifying it, finding the pin map
 - 2026-10-31 · [Hello e-paper](journal/2026-10-31-hello-epaper.md): back up, flash a hello-world sketch, restore factory firmware ([code](projects/01-hello-epaper/))
+- 2026-10-31 · [Philolog](journal/2026-10-31-philolog.md): a daily French philosophy nugget, with buttons to read more ([code](projects/02-philolog/))
 
 ## Resources
 

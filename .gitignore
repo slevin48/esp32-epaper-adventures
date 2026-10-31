@@ -22,3 +22,7 @@ __pycache__/
 
 # Flash backups (may contain Wi-Fi credentials in NVS)
 backups/
+
+# Philolog: generated from the private philolog repo, and Wi-Fi credentials
+projects/02-philolog/philolog/nuggets.h
+projects/02-philolog/philolog/secrets.h
