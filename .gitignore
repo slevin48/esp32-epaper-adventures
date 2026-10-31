@@ -19,3 +19,6 @@ dependencies.lock
 venv/
 .venv/
 __pycache__/
+
+# Flash backups (may contain Wi-Fi credentials in NVS)
+backups/

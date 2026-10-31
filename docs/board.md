@@ -43,6 +43,8 @@ The battery plugs into the 2-pin MX1.25 lithium battery connector. I followed Wa
 
 ## Tooling
 
+- **PSRAM is octal.** Use `PSRAM=opi` in Arduino or `CONFIG_SPIRAM_MODE_OCT=y` in ESP-IDF; quad mode fails to detect it.
+
 - **ESP-IDF:** v5.5 or newer
 - **Arduino:** arduino-esp32 v3.3.0 or newer; LVGL v8.3.11 or v9.3.0 and SensorLib v0.3.1
 - **Flashing / serial:** `pip install esptool pyserial`
