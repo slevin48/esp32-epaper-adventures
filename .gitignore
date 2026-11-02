@@ -26,3 +26,6 @@ backups/
 # Philolog: generated from the private philolog repo, and Wi-Fi credentials
 projects/02-philolog/philolog/nuggets.h
 projects/02-philolog/philolog/secrets.h
+
+# InkBoy: upstream clone (our changes live in projects/03-inkboy/*.patch)
+projects/03-inkboy/InkBoy/

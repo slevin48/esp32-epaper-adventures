@@ -1,0 +1,289 @@
+diff --git a/.gitignore b/.gitignore
+index 2d84799..e2aceaf 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -12,3 +12,5 @@ compile_commands.json
+ .vscode/
+ .cache/
+ dist/
++internal_fs/roms/*
++!internal_fs/roms/README.md
+diff --git a/components/ble_gamepad/ble_gamepad.c b/components/ble_gamepad/ble_gamepad.c
+index 773894c..5ff9257 100644
+--- a/components/ble_gamepad/ble_gamepad.c
++++ b/components/ble_gamepad/ble_gamepad.c
+@@ -12,12 +12,52 @@ static const char *TAG = "gamepad";
+ static _Atomic bool connected, stopping, task_running;
+ static _Atomic uint32_t raw_buttons, last_report_ms, reports;
+ static _Atomic(esp_hidh_dev_t *) device;
++static _Atomic bool xbox;  /* the open device is an Xbox Wireless Controller */
+ static bool stack_ready;
+ 
+ enum { STOP_WAIT_MS = 10000, CLOSE_WAIT_MS = 2000, POLL_MS = 20 };
+ 
+ static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time()/1000); }
+ 
++/* Raw bits in the custom controller's layout, so the default mapping applies. */
++enum { RAW_DOWN = 0x01, RAW_LEFT = 0x02, RAW_UP = 0x04, RAW_RIGHT = 0x08,
++       RAW_SELECT = 0x10, RAW_B = 0x20, RAW_A = 0x40, RAW_START = 0x80 };
++
++static bool is_xbox_name(const char *name) { return name && strncmp(name, "Xbox", 4) == 0; }
++
++/* Xbox Wireless Controller over BLE (firmware 5.x), input report 1:
++ * LX LY RX RY LT RT as little-endian u16, then hat (1 = N, clockwise, 0 = centre),
++ * buttons (A 0x01, B 0x02, X 0x08, Y 0x10, LB 0x40, RB 0x80),
++ * buttons (View 0x04, Menu 0x08, Xbox 0x10, LS 0x20, RS 0x40), Share 0x01.
++ * Face buttons follow the Game Boy layout: Xbox A and Y are GB A, B and X are GB B.
++ * The left stick also works as a D-pad. */
++static uint8_t xbox_buttons(const uint8_t *d, size_t length)
++{
++    if (length < 15) return 0;
++    uint8_t raw = 0;
++    static const uint8_t hat[9] = {0, RAW_UP, RAW_UP | RAW_RIGHT, RAW_RIGHT, RAW_DOWN | RAW_RIGHT,
++                                   RAW_DOWN, RAW_DOWN | RAW_LEFT, RAW_LEFT, RAW_UP | RAW_LEFT};
++    if (d[12] <= 8) raw |= hat[d[12]];
++    uint16_t lx = d[0] | d[1] << 8, ly = d[2] | d[3] << 8;  /* 0..65535, centre 32768 */
++    if (lx < 16384) raw |= RAW_LEFT;
++    if (lx > 49152) raw |= RAW_RIGHT;
++    if (ly < 16384) raw |= RAW_UP;
++    if (ly > 49152) raw |= RAW_DOWN;
++    if (d[13] & (0x01 | 0x10)) raw |= RAW_A;
++    if (d[13] & (0x02 | 0x08)) raw |= RAW_B;
++    if (d[14] & 0x04) raw |= RAW_SELECT;
++    if (d[14] & 0x08) raw |= RAW_START;
++    return raw;
++}
++
++static void store_buttons(uint8_t buttons)
++{
++    uint32_t previous = atomic_exchange(&raw_buttons, buttons);
++    atomic_store(&last_report_ms, now_ms());
++    atomic_fetch_add(&reports, 1);
++    if (previous != buttons) ESP_LOGI(TAG, "PAD_BUTTONS,%02x", buttons);
++}
++
+ static void hid_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+ {
+     (void)arg; (void)base;
+@@ -27,6 +67,7 @@ static void hid_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+         atomic_store(&raw_buttons, 0);
+         atomic_store(&last_report_ms, now_ms());
+         atomic_store(&connected, event->open.status == ESP_OK);
++        atomic_store(&xbox, event->open.status == ESP_OK && is_xbox_name(esp_hidh_dev_name_get(event->open.dev)));
+         ESP_LOGI(TAG, "PAD_OPEN,status,%d,name,%s", event->open.status,
+                  event->open.status == ESP_OK ? esp_hidh_dev_name_get(event->open.dev) : "failed");
+         if (event->open.status == ESP_OK) esp_hidh_dev_dump(event->open.dev, stdout);
+@@ -34,17 +75,17 @@ static void hid_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+     case ESP_HIDH_INPUT_EVENT:
+         /* ESP32-BLE-Gamepad 0.7.4: report 3 begins with the little-endian
+          * button bitmap. esp_hidh reports ID separately, outside data[]. */
+-        if (event->input.report_id == 3 && event->input.length >= 2) {
+-            uint8_t buttons = event->input.data[0];
+-            uint32_t previous = atomic_exchange(&raw_buttons, buttons);
+-            atomic_store(&last_report_ms, now_ms());
+-            atomic_fetch_add(&reports, 1);
+-            if (previous != buttons) ESP_LOGI(TAG, "PAD_BUTTONS,%02x", buttons);
++        if (atomic_load(&xbox)) {
++            if (event->input.report_id == 1) store_buttons(xbox_buttons(event->input.data, event->input.length));
++            else ESP_LOGD(TAG, "PAD_XBOX_REPORT,id,%u,len,%u", event->input.report_id, event->input.length);
++        } else if (event->input.report_id == 3 && event->input.length >= 2) {
++            store_buttons(event->input.data[0]);
+         }
+         break;
+     case ESP_HIDH_CLOSE_EVENT:
+         atomic_store(&raw_buttons, 0);
+         atomic_store(&connected, false);
++        atomic_store(&xbox, false);
+         atomic_store(&device, NULL);
+         ESP_LOGI(TAG, "PAD_DISCONNECTED: released all buttons; rescanning");
+         break;
+@@ -59,13 +100,13 @@ static void connect_task(void *unused)
+         if (!atomic_load(&connected)) {
+             size_t count = 0;
+             esp_hid_scan_result_t *results = NULL;
+-            ESP_LOGI(TAG, "PAD_SCAN: looking for ESP32 Gamepad");
++            ESP_LOGI(TAG, "PAD_SCAN: looking for ESP32 Gamepad or Xbox Wireless Controller");
+             esp_err_t error = esp_hid_scan(3, &count, &results);
+             if (error == ESP_OK) {
+                 for (esp_hid_scan_result_t *r = results; r && !atomic_load(&stopping); r = r->next) {
+                     if (r->transport == ESP_HID_TRANSPORT_BLE && r->name &&
+-                        strcmp(r->name, "ESP32 Gamepad") == 0) {
+-                        ESP_LOGI(TAG, "PAD_CONNECT,rssi,%d", r->rssi);
++                        (strcmp(r->name, "ESP32 Gamepad") == 0 || is_xbox_name(r->name))) {
++                        ESP_LOGI(TAG, "PAD_CONNECT,%s,rssi,%d", r->name, r->rssi);
+                         /* esp_hidh's BLE open waits for discovery completion. */
+                         esp_hidh_dev_t *opened = esp_hidh_dev_open(r->bda, r->transport, r->ble.addr_type);
+                         if (opened) atomic_store(&device, opened);
+@@ -139,13 +180,15 @@ esp_err_t ble_gamepad_stop(void)
+     }
+     atomic_store(&raw_buttons, 0);
+     atomic_store(&connected, false);
++    atomic_store(&xbox, false);
+     return ESP_OK;
+ }
+ 
+ bool ble_gamepad_connected(void)
+ {
+-    return atomic_load(&connected) && atomic_load(&reports) > 0 &&
+-           now_ms() - atomic_load(&last_report_ms) < 2000;
++    if (!atomic_load(&connected) || atomic_load(&reports) == 0) return false;
++    /* The Xbox controller only reports on change; the link itself says it's alive. */
++    return atomic_load(&xbox) || now_ms() - atomic_load(&last_report_ms) < 2000;
+ }
+ uint8_t ble_gamepad_raw(void) { return ble_gamepad_connected() ? atomic_load(&raw_buttons) : 0; }
+ uint32_t ble_gamepad_reports(void) { return atomic_load(&reports); }
+diff --git a/internal_fs/roms/README.md b/internal_fs/roms/README.md
+new file mode 100644
+index 0000000..e70c40a
+--- /dev/null
++++ b/internal_fs/roms/README.md
+@@ -0,0 +1,3 @@
++Game Boy ROMs placed here are written to the board's internal flash on
++`idf.py flash` and used when no SD card is inserted. Only use ROMs you have
++the right to use (for example, dumped from your own cartridges).
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index 869d34f..a103635 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -7,3 +7,10 @@ if(INKBOY_DIAGNOSTICS)
+     target_compile_definitions(${COMPONENT_LIB} PRIVATE INKBOY_DIAGNOSTICS=1)
+     target_sources(${COMPONENT_LIB} PRIVATE "diagnostics.c")
+ endif()
++
++# Games preloaded into internal flash, used when no SD card is inserted.
++# Put .gb files in internal_fs/roms/ (git-ignored except the README).
++set(INTERNAL_FS "${CMAKE_SOURCE_DIR}/internal_fs")
++if(EXISTS "${INTERNAL_FS}/roms")
++    fatfs_create_spiflash_image(storage "${INTERNAL_FS}" FLASH_IN_PROJECT PRESERVE_TIME)
++endif()
+diff --git a/main/display_config.c b/main/display_config.c
+index c5df830..5ab814d 100644
+--- a/main/display_config.c
++++ b/main/display_config.c
+@@ -5,7 +5,7 @@ static display_config_t current = {
+     .mode = DISPLAY_GRAYSCALE,
+     .dither_black_pulses = DITHER_PULSES_DEFAULT,
+     .dither_white_pulses = DITHER_PULSES_DEFAULT,
+-    .border = BORDER_BLACK_LOGO,
++    .border = BORDER_FILL,  /* no black frame: scale the game to the full panel width */
+ };
+ 
+ display_config_t display_config_get(void)
+diff --git a/main/game_storage.c b/main/game_storage.c
+index 849eff4..386878b 100644
+--- a/main/game_storage.c
++++ b/main/game_storage.c
+@@ -15,6 +15,9 @@
+ #define ROOT "/sdcard"
+ #define ROM_DIR ROOT "/roms"
+ static sdmmc_card_t *card;
++/* Without an SD card, fall back to the FAT partition in internal flash. */
++static wl_handle_t internal = WL_INVALID_HANDLE;
++static bool mounted(void) { return card || internal != WL_INVALID_HANDLE; }
+ static const char *TAG = "storage";
+ 
+ static esp_err_t state_error(state_file_status_t status)
+@@ -39,7 +42,7 @@ static bool state_path_for(const game_entry_t *entry, char path[GAME_PATH_BYTES]
+ 
+ esp_err_t game_storage_mount(void)
+ {
+-    if (card) return ESP_OK;
++    if (mounted()) return ESP_OK;
+     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+     host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+@@ -47,7 +50,17 @@ esp_err_t game_storage_mount(void)
+     const esp_vfs_fat_sdmmc_mount_config_t mount = {
+         .format_if_mount_failed = false, .max_files = 3,
+     };
+-    return esp_vfs_fat_sdmmc_mount(ROOT, &host, &slot, &mount, &card);
++    esp_err_t error = esp_vfs_fat_sdmmc_mount(ROOT, &host, &slot, &mount, &card);
++    if (error == ESP_OK) return ESP_OK;
++    card = NULL;
++    ESP_LOGW(TAG, "STORAGE_SD_FAILED,%s; trying internal flash", esp_err_to_name(error));
++    const esp_vfs_fat_mount_config_t flash_mount = {
++        .format_if_mount_failed = false, .max_files = 3,
++    };
++    error = esp_vfs_fat_spiflash_mount_rw_wl(ROOT, "storage", &flash_mount, &internal);
++    if (error != ESP_OK) internal = WL_INVALID_HANDLE;
++    else ESP_LOGI(TAG, "STORAGE_INTERNAL: using the storage partition");
++    return error;
+ }
+ 
+ const char *game_storage_root(void)
+@@ -57,6 +70,11 @@ const char *game_storage_root(void)
+ 
+ esp_err_t game_storage_close(void)
+ {
++    if (internal != WL_INVALID_HANDLE) {
++        esp_err_t error = esp_vfs_fat_spiflash_unmount_rw_wl(ROOT, internal);
++        if (error == ESP_OK) internal = WL_INVALID_HANDLE;
++        return error;
++    }
+     if (!card) return ESP_OK;
+     esp_err_t error = esp_vfs_fat_sdcard_unmount(ROOT, card);
+     if (error == ESP_OK) card = NULL;
+@@ -74,7 +92,7 @@ esp_err_t game_storage_read(const game_entry_t *entry, uint8_t **rom, size_t *si
+ {
+     *rom = NULL; *size = 0;
+     char rom_path[GAME_PATH_BYTES], save_path[GAME_PATH_BYTES];
+-    if (!card || !game_catalog_paths(ROM_DIR, entry, rom_path, save_path)) return ESP_ERR_INVALID_STATE;
++    if (!mounted() || !game_catalog_paths(ROM_DIR, entry, rom_path, save_path)) return ESP_ERR_INVALID_STATE;
+     esp_err_t result;
+     struct stat info;
+     if (stat(rom_path, &info) != 0) { result = ESP_ERR_NOT_FOUND; goto fail; }
+@@ -108,7 +126,7 @@ esp_err_t game_storage_load_save(const game_entry_t *entry, const uint8_t *rom,
+                                  uint8_t *data, size_t capacity, size_t *loaded)
+ {
+     char rom_path[GAME_PATH_BYTES], save_path[GAME_PATH_BYTES];
+-    if (!card || !capacity || !loaded || !game_catalog_paths(ROM_DIR, entry, rom_path, save_path)) return ESP_ERR_INVALID_STATE;
++    if (!mounted() || !capacity || !loaded || !game_catalog_paths(ROM_DIR, entry, rom_path, save_path)) return ESP_ERR_INVALID_STATE;
+     rom_file_status_t status = read_save(save_path, rom, rom_size, data, capacity, loaded);
+     if (status != ROM_FILE_OK) {
+         char backup_path[GAME_PATH_BYTES + 4];
+@@ -125,7 +143,7 @@ esp_err_t game_storage_load_save(const game_entry_t *entry, const uint8_t *rom,
+ esp_err_t game_storage_save(const game_entry_t *entry, const uint8_t *data, size_t size)
+ {
+     char rom_path[GAME_PATH_BYTES], save_path[GAME_PATH_BYTES];
+-    if (!card || !size || !game_catalog_paths(ROM_DIR, entry, rom_path, save_path)) return ESP_ERR_INVALID_STATE;
++    if (!mounted() || !size || !game_catalog_paths(ROM_DIR, entry, rom_path, save_path)) return ESP_ERR_INVALID_STATE;
+     if (!save_file_replace(save_path, data, size)) return ESP_FAIL;
+     ESP_LOGI(TAG, "SAVE_WRITTEN,bytes,%zu", size);
+     return ESP_OK;
+@@ -141,7 +159,7 @@ esp_err_t game_storage_save_state(const game_entry_t *entry, uint32_t rom_crc32,
+                                   size_t payload_size)
+ {
+     char path[GAME_PATH_BYTES];
+-    if (!card || !state_path_for(entry, path)) return ESP_ERR_INVALID_STATE;
++    if (!mounted() || !state_path_for(entry, path)) return ESP_ERR_INVALID_STATE;
+     state_file_status_t status = state_file_write(path, rom_crc32, rom_size, payload, payload_size);
+     if (status == STATE_FILE_OK) ESP_LOGI(TAG, "STATE_WRITTEN,bytes,%zu", payload_size);
+     return state_error(status);
+@@ -152,7 +170,7 @@ esp_err_t game_storage_load_state(const game_entry_t *entry, uint32_t rom_crc32,
+                                   size_t exact_payload_size)
+ {
+     char path[GAME_PATH_BYTES];
+-    if (!card || !state_path_for(entry, path)) return ESP_ERR_INVALID_STATE;
++    if (!mounted() || !state_path_for(entry, path)) return ESP_ERR_INVALID_STATE;
+     state_file_status_t status = state_file_read(path, rom_crc32, rom_size,
+                                                  payload, exact_payload_size);
+     if (status == STATE_FILE_OK) ESP_LOGI(TAG, "STATE_LOADED,bytes,%zu", exact_payload_size);
+@@ -167,7 +185,7 @@ esp_err_t game_storage_has_state(const game_entry_t *entry, uint32_t rom_crc32,
+         return ESP_ERR_INVALID_ARG;
+     *exists = false;
+     char path[GAME_PATH_BYTES];
+-    if (!card || !state_path_for(entry, path)) return ESP_ERR_INVALID_STATE;
++    if (!mounted() || !state_path_for(entry, path)) return ESP_ERR_INVALID_STATE;
+     uint8_t *probe = malloc(exact_payload_size);
+     if (!probe) return ESP_ERR_NO_MEM;
+     state_file_status_t status = state_file_read(path, rom_crc32, rom_size,
+diff --git a/partitions.csv b/partitions.csv
+index bfad05c..55662a6 100644
+--- a/partitions.csv
++++ b/partitions.csv
+@@ -3,4 +3,4 @@
+ nvs,data,nvs,0x9000,0x5000,
+ otadata,data,ota,0xe000,0x2000,
+ app0,app,ota_0,0x10000,0x300000,
+-spiffs,data,spiffs,0x310000,0x4f0000,
++storage,data,fat,0x310000,0x4f0000,
